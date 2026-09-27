@@ -1,0 +1,27 @@
+services:
+  mongo:
+    image: mongo:8.0
+    container_name: mongo
+    restart: unless-stopped
+    command: --replSet overleaf
+    volumes:
+      - mongo_data:/data/db
+    extra_hosts:
+      - "mongo:127.0.0.1"
+    networks:
+      - backend-net
+    healthcheck:
+      test: >
+        mongosh --quiet --eval
+        'try { rs.status().ok } catch (e) { rs.initiate({_id: "overleaf", members: [{_id: 0, host: "mongo:27017"}]}).ok }'
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+networks:
+  backend-net:
+    external: true
+
+volumes:
+  mongo_data:

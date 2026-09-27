@@ -1,0 +1,17 @@
+services:
+  redis:
+    image: redis:7.4
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend-net
+
+networks:
+  backend-net:
+    external: true
+
+volumes:
+  redis_data:
