@@ -8,14 +8,26 @@ services:
       - redis_data:/data
     networks:
       - backend-net
+
   redisinsight:
     image: redis/redisinsight:latest
     container_name: redisinsight
-    ports:
-      - "5540:5540"
+    restart: unless-stopped
     depends_on:
       - redis
-    networks: [backend-net]
+    volumes:
+      - redisinsight_data:/data
+    networks:
+      - backend-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.redisinsight.rule=Host(`redisinsight.sanattudu.tech`)"
+      - "traefik.http.routers.redisinsight.entrypoints=websecure"
+      - "traefik.http.routers.redisinsight.tls=true"
+      - "traefik.http.routers.redisinsight.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.redisinsight.middlewares=redisinsight-auth"
+      - "traefik.http.middlewares.redisinsight-auth.basicauth.users=${REDISINSIGHT_BASIC_AUTH}"
+      - "traefik.http.services.redisinsight.loadbalancer.server.port=5540"
 
 networks:
   backend-net:
@@ -23,3 +35,4 @@ networks:
 
 volumes:
   redis_data:
+  redisinsight_data:
