@@ -1,6 +1,6 @@
 services:
   redis:
-    image: redis:7.4
+    image: redis:7-alpine
     container_name: redis
     restart: unless-stopped
     command: redis-server --appendonly yes
@@ -8,6 +8,14 @@ services:
       - redis_data:/data
     networks:
       - backend-net
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: redisinsight
+    ports:
+      - "5540:5540"
+    depends_on:
+      - redis
+    networks: [backend-net]
 
 networks:
   backend-net:
