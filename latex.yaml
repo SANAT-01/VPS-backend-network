@@ -2,11 +2,11 @@
 # the image is built from the inlined Dockerfile below (Docker Compose v2.22+).
 #
 #   echo "COMPILE_TOKEN=$(openssl rand -hex 32)" > .env
-#   docker network ls                 # check n8n's network name, see below
+#   docker network ls                 # confirm backend-net exists
 #   docker compose up -d --build      # first build ~5 min, image ~720 MB
 #   docker compose ps                 # wait for "healthy"
 #
-# n8n reaches it on the shared docker network at http://latex:8080/compile.
+# n8n reaches it on the shared backend-net network at http://latex:8080/compile.
 # Nothing is published to the host or the internet.
 #
 #   POST /compile  {"tex":"\\documentclass...","name":"resume-015"} -> application/pdf
@@ -209,10 +209,10 @@ services:
       COMPILE_TIMEOUT_MS: "120000"
       MAX_TEX_BYTES: "2000000"
 
-    # No ports published. n8n talks to it over the shared docker network, so the
-    # compile endpoint is not reachable from the host or the internet.
+    # No ports published. n8n reaches this over the shared backend-net network,
+    # so the compile endpoint is not reachable from the host or the internet.
     networks:
-      - n8n
+      - backend-net
 
     # A .tex is executable input and these are written by an LLM, so the
     # container gets no more of the host than a compile needs.
@@ -233,8 +233,7 @@ services:
       retries: 3
 
 networks:
-  # n8n's existing network. Find the real name with:  docker network ls
-  # It is usually <n8n-compose-folder>_default, e.g. n8n_default.
-  # If it differs, change `name:` below - nothing else needs editing.
+  # The shared backend network already used by your other services
+  # (Postgres, Redis, etc). Confirm it exists with: docker network ls
   backend-net:
     external: true
