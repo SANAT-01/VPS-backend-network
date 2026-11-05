@@ -236,6 +236,6 @@ networks:
   # n8n's existing network. Find the real name with:  docker network ls
   # It is usually <n8n-compose-folder>_default, e.g. n8n_default.
   # If it differs, change `name:` below - nothing else needs editing.
-  n8n:
-    external: true
-    name: ${N8N_NETWORK:-n8n_default}
+  networks:
+    backend-net:
+      external: true
