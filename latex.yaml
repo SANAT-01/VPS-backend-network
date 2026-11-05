@@ -1,0 +1,241 @@
+# Self-hosted LaTeX compiler for the VPS. Everything is in this one file -
+# the image is built from the inlined Dockerfile below (Docker Compose v2.22+).
+#
+#   echo "COMPILE_TOKEN=$(openssl rand -hex 32)" > .env
+#   docker network ls                 # check n8n's network name, see below
+#   docker compose up -d --build      # first build ~5 min, image ~720 MB
+#   docker compose ps                 # wait for "healthy"
+#
+# n8n reaches it on the shared docker network at http://latex:8080/compile.
+# Nothing is published to the host or the internet.
+#
+#   POST /compile  {"tex":"\\documentclass...","name":"resume-015"} -> application/pdf
+#   GET  /health                                                    -> {"ok":true}
+
+services:
+  latex:
+    image: latex-compile:slim
+    container_name: latex
+    restart: unless-stopped
+
+    build:
+      dockerfile_inline: |
+        # syntax=docker/dockerfile:1.4
+        #
+        # ~720 MB, not the 9 GB of texlive/texlive:latest: TeX Live's basic
+        # scheme plus only the packages this resume template actually loads.
+        FROM node:22-bookworm-slim
+
+        ENV DEBIAN_FRONTEND=noninteractive
+
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+              perl wget xz-utils ca-certificates fontconfig \
+            && rm -rf /var/lib/apt/lists/*
+
+        # scheme-basic keeps it small; no documentation, no sources.
+        RUN set -eux; \
+            mkdir -p /tmp/tl; cd /tmp/tl; \
+            wget -qO- https://mirror.ctan.org/systems/texlive/tlnet/install-tl-unx.tar.gz \
+              | tar xz --strip-components=1; \
+            printf '%s\n' \
+              'selected_scheme scheme-basic' \
+              'TEXDIR /usr/local/texlive' \
+              'TEXMFLOCAL /usr/local/texlive/texmf-local' \
+              'TEXMFSYSVAR /usr/local/texlive/texmf-var' \
+              'TEXMFSYSCONFIG /usr/local/texlive/texmf-config' \
+              'option_doc 0' \
+              'option_src 0' > profile.txt; \
+            ./install-tl -profile profile.txt; \
+            rm -rf /tmp/tl
+
+        # The bin directory is architecture-named (x86_64-linux on the VPS,
+        # aarch64-linux on an Apple Silicon Mac), so resolve it, do not hardcode.
+        RUN ln -s /usr/local/texlive/bin/* /usr/local/texlive/bin/default
+        ENV PATH="/usr/local/texlive/bin/default:$${PATH}"
+
+        # TeX Live package names, checked against texlive.tlpdb rather than
+        # guessed:
+        #   sourcesanspro.sty ships in the package called "sourcesans"
+        #   tabularx comes from "tools", already in scheme-basic
+        #   ly1 supplies ly1enc.def, which sourcesans needs
+        #   ec + cm-super are the fonts \usepackage[T1]{fontenc} requires
+        # If a future template needs more, the 422 log names the missing file -
+        # add the package here and rebuild.
+        ENV TEX_PACKAGES="latexmk fancyhdr titlesec enumitem needspace marvosym \
+            sourcesans ly1 ec cm-super preprint hyperref ulem babel-english xcolor \
+            etoolbox xkeyval kvoptions ltxcmds infwarerr pdftexcmds epstopdf-pkg \
+            fontaxes mweights"
+
+        RUN tlmgr install $${TEX_PACKAGES} && tlmgr path add && \
+            rm -rf /usr/local/texlive/texmf-var/web2c/*.log
+
+        # ------------------------------------------------------------ service
+        # No npm dependencies: node's own http is enough, and a service with no
+        # package tree is one less thing to keep patched.
+        COPY <<'JS' /srv/server.js
+        import { createServer } from 'node:http';
+        import { execFile } from 'node:child_process';
+        import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+        import { join } from 'node:path';
+        import { tmpdir } from 'node:os';
+        import { timingSafeEqual } from 'node:crypto';
+
+        const PORT = Number(process.env.PORT || 8080);
+        const TOKEN = process.env.COMPILE_TOKEN || '';
+        const TIMEOUT_MS = Number(process.env.COMPILE_TIMEOUT_MS || 120000);
+        const MAX_BYTES = Number(process.env.MAX_TEX_BYTES || 2000000);
+
+        // Constant-time compare, so the token cannot be guessed a character at a time.
+        function tokenOk(header) {
+          if (!TOKEN) return true;                   // unset = open, for local runs
+          const given = String(header || '').replace(/^Bearer\s+/i, '');
+          const a = Buffer.from(given), b = Buffer.from(TOKEN);
+          return a.length === b.length && timingSafeEqual(a, b);
+        }
+
+        function run(cmd, args, opts) {
+          return new Promise((resolve) => {
+            execFile(cmd, args, { timeout: TIMEOUT_MS, maxBuffer: 10 << 20, ...opts },
+              (err, stdout, stderr) => resolve({ err, stdout: String(stdout), stderr: String(stderr) }));
+          });
+        }
+
+        // The lines worth returning: LaTeX's file:line:error form and its "! " errors.
+        function errorLines(log) {
+          const hits = log.split('\n').filter(l => /^(?:\.\/|\/).*:\d+:|^! /.test(l));
+          return (hits.length ? hits : log.split('\n').slice(-25)).slice(0, 12).join('\n');
+        }
+
+        async function compile(tex, name) {
+          const dir = await mkdtemp(join(tmpdir(), 'tex-'));
+          try {
+            const base = (name || 'document').replace(/\.tex$/i, '').replace(/[^A-Za-z0-9._-]/g, '_');
+            await writeFile(join(dir, base + '.tex'), tex, 'utf8');
+
+            // -no-shell-escape: a .tex must never be able to run shell commands.
+            // max_print_line stops LaTeX wrapping errors at 79 columns, which
+            // would cut the useful half off the message handed back.
+            const r = await run('latexmk', [
+              '-pdf', '-interaction=nonstopmode', '-halt-on-error', '-file-line-error',
+              '-no-shell-escape', '-outdir=' + dir, join(dir, base + '.tex'),
+            ], { cwd: dir, env: { ...process.env, max_print_line: '300', error_line: '254', half_error_line: '238' } });
+
+            try {
+              return { pdf: await readFile(join(dir, base + '.pdf')) };
+            } catch {
+              let log = r.stdout + r.stderr;
+              try { log = await readFile(join(dir, base + '.log'), 'utf8'); } catch { /* use stdout */ }
+              return { error: errorLines(log), timedOut: !!(r.err && r.err.killed) };
+            }
+          } finally {
+            await rm(dir, { recursive: true, force: true });
+          }
+        }
+
+        function readBody(req) {
+          return new Promise((resolve, reject) => {
+            let size = 0;
+            const chunks = [];
+            req.on('data', (c) => {
+              size += c.length;
+              if (size > MAX_BYTES) { reject(new Error('body too large')); req.destroy(); return; }
+              chunks.push(c);
+            });
+            req.on('end', () => resolve(Buffer.concat(chunks)));
+            req.on('error', reject);
+          });
+        }
+
+        const json = (res, code, obj) => {
+          res.writeHead(code, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(obj));
+        };
+
+        createServer(async (req, res) => {
+          if (req.method === 'GET' && req.url === '/health') return json(res, 200, { ok: true });
+          if (req.method !== 'POST' || !req.url.startsWith('/compile')) {
+            return json(res, 404, { error: 'POST /compile or GET /health' });
+          }
+          if (!tokenOk(req.headers.authorization)) return json(res, 401, { error: 'bad or missing token' });
+
+          let body;
+          try { body = await readBody(req); }
+          catch (e) { return json(res, 413, { error: e.message }); }
+
+          let tex, name;
+          if (String(req.headers['content-type'] || '').includes('application/json')) {
+            try {
+              const p = JSON.parse(body.toString('utf8'));
+              tex = p.tex; name = p.name;
+            } catch { return json(res, 400, { error: 'invalid JSON' }); }
+          } else {
+            tex = body.toString('utf8');             // raw .tex, name from ?name=
+            name = new URL(req.url, 'http://x').searchParams.get('name');
+          }
+
+          if (!tex || !String(tex).includes('\\documentclass')) {
+            return json(res, 400, { error: 'no LaTeX document in the request (expected \\documentclass)' });
+          }
+
+          const started = Date.now();
+          const out = await compile(String(tex), name);
+          const ms = Date.now() - started;
+
+          if (out.pdf) {
+            console.log(`ok   $${name || '?'}  $${out.pdf.length} bytes  $${ms}ms`);
+            res.writeHead(200, {
+              'Content-Type': 'application/pdf',
+              'Content-Length': out.pdf.length,
+              'X-Compile-Ms': String(ms),
+            });
+            return res.end(out.pdf);
+          }
+
+          console.log(`FAIL $${name || '?'}  $${ms}ms`);
+          return json(res, 422, { error: out.timedOut ? 'compile timed out' : 'compile failed', log: out.error });
+        }).listen(PORT, () => console.log(`latex compile service on :$${PORT}$${TOKEN ? ' (token required)' : ' (NO TOKEN SET)'}`));
+        JS
+
+        # A .tex is untrusted, executable input, so it is never compiled as root.
+        RUN useradd -m -u 10001 texrunner
+        USER texrunner
+        ENV HOME=/tmp
+
+        EXPOSE 8080
+        CMD ["node", "/srv/server.js"]
+
+    environment:
+      COMPILE_TOKEN: "${COMPILE_TOKEN:?set COMPILE_TOKEN in .env}"
+      COMPILE_TIMEOUT_MS: "120000"
+      MAX_TEX_BYTES: "2000000"
+
+    # No ports published. n8n talks to it over the shared docker network, so the
+    # compile endpoint is not reachable from the host or the internet.
+    networks:
+      - n8n
+
+    # A .tex is executable input and these are written by an LLM, so the
+    # container gets no more of the host than a compile needs.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    pids_limit: 256
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  # n8n's existing network. Find the real name with:  docker network ls
+  # It is usually <n8n-compose-folder>_default, e.g. n8n_default.
+  # If it differs, change `name:` below - nothing else needs editing.
+  n8n:
+    external: true
+    name: ${N8N_NETWORK:-n8n_default}
